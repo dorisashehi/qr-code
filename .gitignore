@@ -102,3 +102,4 @@ logs/
 # *.csv
 # *.json
 documentation
+./backend/data
