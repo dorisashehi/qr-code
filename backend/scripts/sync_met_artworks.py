@@ -1,121 +1,215 @@
-import requests
+import asyncio
+import aiohttp
 import pandas as pd
-import time
+from datetime import datetime
+import json
 
 # API base URL
 BASE_URL = "https://collectionapi.metmuseum.org/public/collection/v1"
 
-def get_object_ids(department_ids, is_highlight=True):
-    """
-    Get object IDs filtered by department and highlight status
-    """
-    # Convert department_ids list to pipe-separated string
-    dept_param = "|".join(map(str, department_ids))
+# Rate limiting settings
+MAX_CONCURRENT_REQUESTS = 5  # how many requests at the same time
+DELAY_BETWEEN_REQUESTS = 0.3  # seconds to wait between requests
 
+
+class RateLimiter:
+    """
+    Simple rate limiter to avoid overwhelming the API
+    This makes sure we don't send too many requests at once
+    """
+    def __init__(self, max_concurrent, delay):
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.delay = delay
+        self.last_request_time = 0
+
+    async def acquire(self):
+        """Wait until we're allowed to make another request"""
+        await self.semaphore.acquire()
+
+        # make sure we wait enough time since last request
+        current_time = asyncio.get_event_loop().time()
+        time_since_last = current_time - self.last_request_time
+
+        if time_since_last < self.delay:
+            await asyncio.sleep(self.delay - time_since_last)
+
+        self.last_request_time = asyncio.get_event_loop().time()
+
+    def release(self):
+        """Release the semaphore so another request can go"""
+        self.semaphore.release()
+
+
+async def get_object_ids(session, department_id, rate_limiter):
+    """
+    Get list of object IDs for a specific department
+    This only gets the IDs, not the full details yet
+    """
     url = f"{BASE_URL}/objects"
     params = {
-        "departmentIds": dept_param,
-        "isHighlight": str(is_highlight).lower()
+        "departmentIds": str(department_id),
+        "isHighlight": "true"
     }
 
-    response = requests.get(url, params=params)
-    response.raise_for_status()
+    await rate_limiter.acquire()
+    try:
+        async with session.get(url, params=params) as response:
+            data = await response.json()
+            object_ids = data.get("objectIDs", [])
+            print(f"Department {department_id}: Found {len(object_ids)} highlighted objects")
+            return object_ids
+    except Exception as e:
+        print(f"Error getting object IDs for department {department_id}: {e}")
+        return []
+    finally:
+        rate_limiter.release()
 
-    data = response.json()
-    return data.get("objectIDs", [])
 
-def get_object_details(object_id):
+async def get_object_details(session, object_id, rate_limiter):
     """
-    Get detailed information for a specific object
+    Get full details for a single object
+    This is where we get all the info about the artwork
     """
     url = f"{BASE_URL}/objects/{object_id}"
 
+    await rate_limiter.acquire()
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data
+            else:
+                print(f"Failed to fetch object {object_id}: status {response.status}")
+                return None
     except Exception as e:
         print(f"Error fetching object {object_id}: {e}")
         return None
+    finally:
+        rate_limiter.release()
+
+
+async def fetch_department_objects(session, department_id, limit, rate_limiter):
+    """
+    Fetch objects for one department
+    This gets the IDs first, then fetches all the details in parallel
+    """
+    print(f"\n{'='*60}")
+    print(f"Starting to process Department {department_id}")
+    print('='*60)
+
+    # step 1: get the list of object IDs
+    object_ids = await get_object_ids(session, department_id, rate_limiter)
+
+    # limit how many we fetch
+    object_ids = object_ids[:limit]
+
+    print(f"Will fetch details for {len(object_ids)} objects from department {department_id}")
+
+    # step 2: fetch all object details in parallel
+    # this is the magic part - we fetch multiple objects at the same time!
+    tasks = []
+    for obj_id in object_ids:
+        task = get_object_details(session, obj_id, rate_limiter)
+        tasks.append(task)
+
+    # wait for all the tasks to complete
+    results = await asyncio.gather(*tasks)
+
+    # step 3: extract the data we want from each object
+    objects_data = []
+    for obj_details in results:
+        if obj_details:
+            obj_info = {
+                "met_object_id": obj_details.get("objectID"),
+                "title": obj_details.get("title"),
+                "artist_display_name": obj_details.get("artistDisplayName"),
+                "artist_display_bio": obj_details.get("artistDisplayBio"),
+                "artist_nationality": obj_details.get("artistNationality"),
+                "artist_gender": obj_details.get("artistGender"),
+                "object_date": obj_details.get("objectDate"),
+                "object_begin_date": obj_details.get("objectBeginDate"),
+                "object_end_date": obj_details.get("objectEndDate"),
+                "culture": obj_details.get("culture"),
+                "period": obj_details.get("period"),
+                "dynasty": obj_details.get("dynasty"),
+                "medium": obj_details.get("medium"),
+                "dimensions": obj_details.get("dimensions"),
+                "department": obj_details.get("department"),
+                "classification": obj_details.get("classification"),
+                "object_name": obj_details.get("objectName"),
+                "primary_image": obj_details.get("primaryImage"),
+                "is_public_domain": obj_details.get("isPublicDomain", False),
+                "constituents": obj_details.get("constituents"),
+                "synced_at": pd.Timestamp.now()
+            }
+            objects_data.append(obj_info)
+
+    print(f"Successfully fetched {len(objects_data)} objects from department {department_id}")
+    return objects_data
+
+
+async def fetch_all_departments(department_ids, limit_per_department):
+    """
+    Main function that fetches objects from all departments in parallel
+    Each department is processed at the same time for maximum speed
+    """
+    # create a rate limiter that all requests will share
+    rate_limiter = RateLimiter(MAX_CONCURRENT_REQUESTS, DELAY_BETWEEN_REQUESTS)
+
+    # create an HTTP session that will be reused for all requests
+    async with aiohttp.ClientSession() as session:
+        # create a task for each department
+        # these will all run at the same time!
+        tasks = []
+        for dept_id in department_ids:
+            task = fetch_department_objects(session, dept_id, limit_per_department, rate_limiter)
+            tasks.append(task)
+
+        # wait for all departments to finish
+        results = await asyncio.gather(*tasks)
+
+        # combine all the objects from all departments into one list
+        all_objects = []
+        for dept_objects in results:
+            all_objects.extend(dept_objects)
+
+        return all_objects
+
 
 def fetch_museum_data(department_ids, limit_per_department=20):
     """
-    Fetch highlighted objects from specified departments
-
-    Parameters:
-    - department_ids: list of department IDs (e.g., [1, 11])
-    - limit_per_department: maximum number of objects to fetch PER department
-
-    Returns:
-    - DataFrame with object details
+    This is the main function you call to get the data
+    It sets up everything and runs the async code
     """
-    all_objects_data = []
+    print("Starting to fetch museum data...")
+    print(f"Departments: {department_ids}")
+    print(f"Objects per department: {limit_per_department}")
+    print(f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
+    print(f"Delay between requests: {DELAY_BETWEEN_REQUESTS} seconds")
 
-    for dept_id in department_ids:
-        print(f"\n{'='*60}")
-        print(f"Processing Department ID: {dept_id}")
-        print('='*60)
+    # run the async code
+    # this is the special syntax needed to start async functions
+    all_objects = asyncio.run(fetch_all_departments(department_ids, limit_per_department))
 
-        print(f"Fetching object IDs for department {dept_id}...")
-        object_ids = get_object_ids([dept_id], is_highlight=True)
+    # convert to dataframe
+    df = pd.DataFrame(all_objects)
 
-        # Limit the number of objects to fetch for this department
-        object_ids = object_ids[:limit_per_department]
-
-        print(f"Found {len(object_ids)} highlighted objects. Fetching details...")
-
-        for idx, obj_id in enumerate(object_ids, 1):
-            print(f"  Fetching object {idx}/{len(object_ids)}: ID {obj_id}")
-
-            obj_details = get_object_details(obj_id)
-
-            if obj_details:
-                # Extract all requested fields
-                obj_info = {
-                    "met_object_id": obj_details.get("objectID"),
-                    "title": obj_details.get("title"),
-                    "artist_display_name": obj_details.get("artistDisplayName"),
-                    "artist_display_bio": obj_details.get("artistDisplayBio"),
-                    "artist_nationality": obj_details.get("artistNationality"),
-                    "artist_gender": obj_details.get("artistGender"),
-                    "object_date": obj_details.get("objectDate"),
-                    "object_begin_date": obj_details.get("objectBeginDate"),
-                    "object_end_date": obj_details.get("objectEndDate"),
-                    "culture": obj_details.get("culture"),
-                    "period": obj_details.get("period"),
-                    "dynasty": obj_details.get("dynasty"),
-                    "medium": obj_details.get("medium"),
-                    "dimensions": obj_details.get("dimensions"),
-                    "department": obj_details.get("department"),
-                    "classification": obj_details.get("classification"),
-                    "object_name": obj_details.get("objectName"),
-                    "primary_image": obj_details.get("primaryImage"),
-                    "is_public_domain": obj_details.get("isPublicDomain", False),
-                    "constituents": obj_details.get("constituents"),  # Will store as list
-                    "synced_at": pd.Timestamp.now()
-                }
-                all_objects_data.append(obj_info)
-
-            # Be respectful to the API - add a small delay
-            time.sleep(0.5)
-
-    # Create DataFrame
-    df = pd.DataFrame(all_objects_data)
-
-    # Add auto-increment id as index + 1
+    # add id column
     df.insert(0, 'id', range(1, len(df) + 1))
 
-    # Add created_at and updated_at timestamps
+    # add timestamps
     current_time = pd.Timestamp.now()
     df['created_at'] = current_time
     df['updated_at'] = current_time
 
     print(f"\n{'='*60}")
-    print(f"Successfully fetched {len(df)} objects total!")
+    print(f"ALL DONE! Fetched {len(df)} objects total")
     print('='*60)
+
     return df
 
-# Example usage
+
+# main code that runs when you execute the script
 if __name__ == "__main__":
     # Department IDs:
     # 1 = American Decorative Arts
@@ -123,30 +217,23 @@ if __name__ == "__main__":
 
     department_ids = [1, 11]
 
-    # Fetch data - 20 objects PER department
+    # fetch the data - this will get 20 objects from EACH department
     df = fetch_museum_data(department_ids, limit_per_department=20)
 
-    # Display basic info
-    print("\n" + "="*50)
+    # show some stats
+    print("\n" + "="*60)
     print("DATASET OVERVIEW")
-    print("="*50)
+    print("="*60)
     print(f"Total objects: {len(df)}")
-    print(f"\nColumns: {list(df.columns)}")
     print(f"\nDepartments represented:")
     print(df["department"].value_counts())
 
-    # Display first few rows
-    print("\n" + "="*50)
+    # show first few rows
+    print("\n" + "="*60)
     print("SAMPLE DATA")
-    print("="*50)
+    print("="*60)
     print(df[["id", "met_object_id", "title", "artist_display_name", "object_date", "department"]].head(10))
 
-    # Display data types
-    print("\n" + "="*50)
-    print("DATA TYPES")
-    print("="*50)
-    print(df.dtypes)
-
-    # Save to CSV (optional)
+    # save to CSV
     df.to_csv("../data/met_museum_highlights.csv", index=False)
     print("\nData saved to 'met_museum_highlights.csv'")

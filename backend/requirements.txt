@@ -4,3 +4,4 @@ sqlalchemy
 requests
 qrcode
 pandas
+aiohttp
