@@ -18,6 +18,7 @@ from langchain_groq import ChatGroq
 from langchain_core.tools import Tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from database.database import get_db_session
 from database.models import Artwork
 
@@ -71,7 +72,7 @@ class ResearchResponse(BaseModel):
     object_url: Optional[str] = Field(None, description="URL to artwork page on MET website")
 
 
-def fetch_artwork_by_met_id(met_object_id: int) -> Dict[str, Any]:
+def fetch_artwork_by_met_id(met_object_id: str) -> Dict[str, Any]:
     """
     Fetch artwork from database by MET Museum object ID.
 
@@ -79,20 +80,21 @@ def fetch_artwork_by_met_id(met_object_id: int) -> Dict[str, Any]:
     It queries the database using the MET object ID.
 
     Args:
-        met_object_id: The MET Museum object ID
+        met_object_id: The MET Museum object ID (as string)
 
     Returns:
         Dictionary with artwork data, or error message if not found
     """
     try:
+        met_id_int = int(met_object_id)
         with get_db_session() as db:
             artwork = db.query(Artwork).filter(
-                Artwork.met_object_id == met_object_id
+                Artwork.met_object_id == met_id_int
             ).first()
 
             if artwork is None:
                 return {
-                    "error": f"Artwork with MET ID {met_object_id} not found",
+                    "error": f"Artwork with MET ID {met_id_int} not found",
                     "found": False
                 }
 
@@ -136,7 +138,7 @@ artwork_by_met_id_tool = Tool(
     func=fetch_artwork_by_met_id,
     description=(
         "Fetch artwork from database using the MET Museum object ID. "
-        "Input should be an integer MET object ID."
+        "Input should be a string containing the MET object ID number."
     )
 )
 
@@ -150,7 +152,38 @@ llm = ChatGroq(
 
 parser = PydanticOutputParser(pydantic_object=ResearchResponse)
 
-llm_with_tools = llm.bind_tools(tools)
+prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a research assistant for the Metropolitan Museum of Art.
+            Your job is to help fetch and organize artwork information from the database.
+
+            When given a MET object ID, use the tool to fetch the artwork data from
+            the database. Then organize and return the information in a structured format.
+
+            Always use the tools to fetch data - never make up information.
+            If an artwork is not found, clearly state that it was not found.
+            """
+        ),
+        ("placeholder", "{chat_history}"),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ]
+)
+
+agent = create_tool_calling_agent(
+    llm=llm,
+    tools=tools,
+    prompt=prompt
+)
+
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    handle_parsing_errors=True
+)
 
 
 class ResearchAgent:
@@ -163,7 +196,8 @@ class ResearchAgent:
 
     def __init__(self):
         """Initialize the Research Agent."""
-        self.llm = llm_with_tools
+        self.agent_executor = agent_executor
+        self.llm = llm
         self.tools = tools
 
     def research(
@@ -179,7 +213,11 @@ class ResearchAgent:
         Returns:
             ResearchResponse with artwork data, or None if not found
         """
+        query = f"Fetch artwork with MET object ID {met_object_id} from the database"
+
         try:
+            self.agent_executor.invoke({"input": query})
+
             artwork_data = fetch_artwork_by_met_id(met_object_id)
 
             if not artwork_data.get("found", False):
